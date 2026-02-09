@@ -31,5 +31,6 @@ RUN pip install --upgrade pip setuptools wheel \
 
 EXPOSE 8000
 
-# Default API server. Use env vars to configure models and device.
-ENTRYPOINT ["qwen-tts-api"]
+# Default API server via uvicorn. Args can be overridden at runtime.
+ENTRYPOINT ["python", "-m", "uvicorn", "qwen_tts.api.server:app"]
+CMD ["--host", "0.0.0.0", "--port", "8000", "--log-level", "info"]
