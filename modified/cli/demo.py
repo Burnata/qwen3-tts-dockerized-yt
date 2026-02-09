@@ -91,7 +91,7 @@ def build_parser() -> argparse.ArgumentParser:
     # Model loading / from_pretrained args
     parser.add_argument(
         "--device",
-        default="cpu",
+        default="cuda:0",
         help="Device for device_map, e.g. cpu, cuda, cuda:0 (default: cpu).",
     )
     parser.add_argument(
