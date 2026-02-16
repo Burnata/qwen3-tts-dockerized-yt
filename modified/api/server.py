@@ -541,6 +541,29 @@ def generate_youtube(req: YouTubeCloneRequest) -> Response:
     return Response(content=payload, media_type="audio/wav", headers=headers)
 
 
+@app.get("/audio/models")
+def audio_models() -> Dict[str, str]:
+    return {
+        "custom_voice": _manager.default_custom,
+        "voice_design": _manager.default_design,
+        "voice_clone": _manager.default_clone,
+    }
+
+
+@app.get("/audio/voices")
+def audio_voices() -> Dict[str, Any]:
+    voices = list(_OPENAI_VOICE_MAP.keys()) if _OPENAI_VOICE_MAP else []
+    return {
+        "voices": voices,
+        "default_speakers": ["Male-en", "Female-en", "Male-zh", "Female-zh"],
+    }
+
+
+@app.post("/audio/speech")
+def audio_speech(req: OpenAISpeechRequest) -> Response:
+    return openai_speech(req)
+
+
 @app.post("/v1/audio/speech")
 def openai_speech(req: OpenAISpeechRequest) -> Response:
     if not req.input or not req.input.strip():
