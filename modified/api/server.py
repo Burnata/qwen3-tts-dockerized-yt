@@ -4,8 +4,10 @@
 
 import base64
 import io
+import json
 import os
 import re
+import subprocess
 import tempfile
 import threading
 from pathlib import Path
@@ -61,6 +63,23 @@ def _encode_audio_wav_bytes(wav: np.ndarray, sr: int) -> bytes:
     return buf.getvalue()
 
 
+def _encode_audio_mp3_bytes(wav: np.ndarray, sr: int) -> bytes:
+    with tempfile.TemporaryDirectory(prefix="qwen_tts_mp3_") as tmp:
+        tmp_dir = Path(tmp)
+        wav_path = tmp_dir / "audio.wav"
+        mp3_path = tmp_dir / "audio.mp3"
+        sf.write(str(wav_path), wav, int(sr), format="WAV")
+        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(wav_path), "-f", "mp3", str(mp3_path)]
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=500, detail="ffmpeg is not installed") from exc
+        except subprocess.CalledProcessError as exc:
+            err = exc.stderr.decode("utf-8", errors="ignore")
+            raise HTTPException(status_code=500, detail=f"ffmpeg failed to encode mp3: {err}") from exc
+        return mp3_path.read_bytes()
+
+
 class TTSRequest(BaseModel):
     mode: Literal["custom_voice", "voice_design", "voice_clone"] = Field(
         ..., description="Which generation mode to use."
@@ -89,6 +108,15 @@ class TTSResponse(BaseModel):
     model: str
     sample_rate: int
     audio_b64: str
+
+
+class OpenAISpeechRequest(BaseModel):
+    model: str = Field(..., description="Model id or override for the local TTS model.")
+    input: str = Field(..., description="Text to synthesize.")
+    voice: str = Field(..., description="Voice name.")
+    response_format: Optional[str] = Field(default="mp3", description="Audio response format.")
+    speed: Optional[float] = Field(default=None, description="Speech speed multiplier.")
+    language: Optional[str] = Field(default="Auto", description="Language (Auto or explicit language).")
 
 
 class YouTubeCloneRequest(BaseModel):
@@ -264,6 +292,42 @@ def _download_youtube_ref(url: str, sub_lang: Optional[str]) -> Tuple[Tuple[np.n
             raise HTTPException(status_code=400, detail="Subtitle file is empty after parsing.")
 
         return ref_audio, ref_text
+
+
+def _normalize_openai_response_format(response_format: Optional[str]) -> str:
+    fmt = (response_format or "mp3").strip().lower()
+    if fmt in ("mp3", "mpeg"):
+        return "mp3"
+    raise HTTPException(status_code=400, detail="Only mp3 response_format is supported")
+
+
+def _load_openai_voice_map() -> Dict[str, Dict[str, Any]]:
+    raw = os.getenv("QWEN_TTS_OPENAI_VOICE_MAP", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail=f"Invalid QWEN_TTS_OPENAI_VOICE_MAP: {exc}") from exc
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=500, detail="QWEN_TTS_OPENAI_VOICE_MAP must be a JSON object")
+    for key, value in data.items():
+        if not isinstance(key, str) or not isinstance(value, dict):
+            raise HTTPException(status_code=500, detail="QWEN_TTS_OPENAI_VOICE_MAP entries must be objects")
+    return data
+
+
+_OPENAI_VOICE_MAP = _load_openai_voice_map()
+
+
+def _resolve_openai_voice(voice: str) -> Dict[str, Any]:
+    cfg = _OPENAI_VOICE_MAP.get(voice)
+    if cfg is None:
+        return {"mode": "custom_voice", "speaker": voice}
+    mode = cfg.get("mode") or "custom_voice"
+    resolved = dict(cfg)
+    resolved["mode"] = mode
+    return resolved
 
 
 app = FastAPI(title="Qwen3-TTS API", version="1.0")
@@ -475,6 +539,85 @@ def generate_youtube(req: YouTubeCloneRequest) -> Response:
         "X-Sample-Rate": str(int(sr)),
     }
     return Response(content=payload, media_type="audio/wav", headers=headers)
+
+
+@app.post("/v1/audio/speech")
+def openai_speech(req: OpenAISpeechRequest) -> Response:
+    if not req.input or not req.input.strip():
+        raise HTTPException(status_code=400, detail="input is required")
+    if not req.voice or not req.voice.strip():
+        raise HTTPException(status_code=400, detail="voice is required")
+
+    fmt = _normalize_openai_response_format(req.response_format)
+    voice_cfg = _resolve_openai_voice(req.voice.strip())
+    mode = voice_cfg.get("mode", "custom_voice")
+    model_override = voice_cfg.get("model") or req.model
+    language = req.language or "Auto"
+
+    if mode == "custom_voice":
+        speaker = voice_cfg.get("speaker") or req.voice.strip()
+        instruct = (voice_cfg.get("instruct") or "").strip() or None
+        model_id, tts = _manager.get("custom_voice", model_override)
+        wavs, sr = tts.generate_custom_voice(
+            text=req.input.strip(),
+            language=language,
+            speaker=speaker,
+            instruct=instruct,
+        )
+    elif mode == "voice_design":
+        instruct = (voice_cfg.get("instruct") or req.voice.strip()).strip()
+        if not instruct:
+            raise HTTPException(status_code=400, detail="instruct is required for voice_design")
+        model_id, tts = _manager.get("voice_design", model_override)
+        wavs, sr = tts.generate_voice_design(
+            text=req.input.strip(),
+            language=language,
+            instruct=instruct,
+        )
+    elif mode == "youtube_clone":
+        youtube_url = voice_cfg.get("youtube_url")
+        if not youtube_url:
+            raise HTTPException(status_code=400, detail="youtube_url is required for youtube_clone voice")
+        sub_lang = voice_cfg.get("sub_lang")
+        ref_audio, ref_text = _download_youtube_ref(str(youtube_url), sub_lang)
+        model_id, tts = _manager.get("voice_clone", model_override)
+        wavs, sr = tts.generate_voice_clone(
+            text=req.input.strip(),
+            language=language,
+            ref_audio=ref_audio,
+            ref_text=ref_text,
+            x_vector_only_mode=bool(voice_cfg.get("x_vector_only_mode", False)),
+        )
+    elif mode == "voice_clone":
+        ref_audio_b64 = voice_cfg.get("ref_audio_b64")
+        ref_text = voice_cfg.get("ref_text")
+        if not ref_audio_b64:
+            raise HTTPException(status_code=400, detail="ref_audio_b64 is required for voice_clone voice")
+        ref_audio = _decode_audio_b64(str(ref_audio_b64))
+        model_id, tts = _manager.get("voice_clone", model_override)
+        wavs, sr = tts.generate_voice_clone(
+            text=req.input.strip(),
+            language=language,
+            ref_audio=ref_audio,
+            ref_text=(str(ref_text).strip() if ref_text else None),
+            x_vector_only_mode=bool(voice_cfg.get("x_vector_only_mode", False)),
+        )
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported voice mode: {mode}")
+
+    if fmt == "mp3":
+        payload = _encode_audio_mp3_bytes(wavs[0], sr)
+        media_type = "audio/mpeg"
+    else:
+        payload = _encode_audio_wav_bytes(wavs[0], sr)
+        media_type = "audio/wav"
+
+    headers = {
+        "X-Mode": mode,
+        "X-Model-Id": model_id,
+        "X-Sample-Rate": str(int(sr)),
+    }
+    return Response(content=payload, media_type=media_type, headers=headers)
 
 
 def main() -> None:
